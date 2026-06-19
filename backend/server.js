@@ -21,6 +21,9 @@ mongoose
 const simulationsRouter = require("./routes/simulations");
 app.use("/api/simulations", simulationsRouter);
 
+const logsRouter = require("./routes/logs");
+app.use("/api/logs", logsRouter);
+
 // Base route for sanity check
 app.get("/", (req, res) => {
   res.send("LOOK Disk Scheduling API is running.");

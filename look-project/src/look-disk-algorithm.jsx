@@ -11,6 +11,8 @@ import {
 const DISK_MAX = 199;
 const TRACK_WIDTH = 680;
 
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
 function trackToX(track) {
   return 48 + ((track / DISK_MAX) * (TRACK_WIDTH - 96));
 }
@@ -43,13 +45,55 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [showSaveInput, setShowSaveInput] = useState(false);
   const [comparisonResults, setComparisonResults] = useState(null);
+  
+  // Live Audit Logs States
+  const [dbLogs, setDbLogs] = useState([]);
 
   const intervalRef = useRef(null);
   const svgRef = useRef(null);
   const animStepRef = useRef(-1);
   animStepRef.current = animStep;
 
-  const runSimulation = useCallback((q, h, d) => {
+  // DB Logs API Actions
+  const fetchLogs = useCallback(async () => {
+    try {
+      const res = await fetch("/api/logs");
+      if (res.ok) {
+        const data = await res.json();
+        setDbLogs(data);
+      }
+    } catch (err) {
+      console.error("Error fetching logs:", err);
+    }
+  }, []);
+
+  const logAction = useCallback(async (action, details) => {
+    try {
+      await fetch("/api/logs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, details }),
+      });
+      fetchLogs();
+    } catch (err) {
+      console.error("Error logging action:", err);
+    }
+  }, [fetchLogs]);
+
+  const handleClearLogs = async () => {
+    try {
+      const res = await fetch("/api/logs", {
+        method: "DELETE"
+      });
+      if (res.ok) {
+        fetchLogs();
+      }
+    } catch (err) {
+      console.error("Error clearing logs:", err);
+    }
+  };
+
+  const runSimulation = useCallback((q, h, d, shouldLog = false) => {
     const parsed = q
       .split(/[,\s]+/)
       .map((s) => parseInt(s.trim()))
@@ -91,7 +135,11 @@ export default function App() {
     setPathPoints([]);
     setArmX(trackToX(headVal));
     clearInterval(intervalRef.current);
-  }, []);
+
+    if (shouldLog) {
+      logAction("SIMULATION_RUN", `Queue: [${parsed.join(", ")}], Head: ${headVal}, Dir: ${d}`);
+    }
+  }, [logAction]);
 
   // API Methods
   const fetchSimulations = useCallback(async () => {
@@ -133,6 +181,7 @@ export default function App() {
         setSaveTitle("");
         setShowSaveInput(false);
         fetchSimulations();
+        logAction("SIMULATION_SAVE", `Saved simulation config: "${title}"`);
       }
     } catch (err) {
       console.error("Error saving simulation:", err);
@@ -149,6 +198,7 @@ export default function App() {
       });
       if (res.ok) {
         fetchSimulations();
+        logAction("SIMULATION_DELETE", `Deleted simulation record ID: ${id}`);
       }
     } catch (err) {
       console.error("Error deleting simulation:", err);
@@ -159,13 +209,46 @@ export default function App() {
     setQueueInput(sim.queue.join(", "));
     setHeadInput(String(sim.head));
     setDirection(sim.direction);
-    runSimulation(sim.queue.join(", "), String(sim.head), sim.direction);
+    runSimulation(sim.queue.join(", "), String(sim.head), sim.direction, false);
+    logAction("SIMULATION_LOAD", `Loaded simulation: "${sim.title}" from MongoDB`);
+  };
+
+  // Per-card dispatch input state: { [simId]: trackValueString }
+  const [dispatchInputs, setDispatchInputs] = useState({});
+  const [dispatchingId, setDispatchingId] = useState(null);
+
+  const handleDispatchTrack = async (sim, e) => {
+    e.stopPropagation();
+    const trackStr = (dispatchInputs[sim._id] || "").trim();
+    const trackNum = parseInt(trackStr);
+    if (isNaN(trackNum) || trackNum < 0 || trackNum > 199) return;
+    setDispatchingId(sim._id);
+    try {
+      const res = await fetch(`/api/simulations/${sim._id}/dispatch`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ track: trackNum }),
+      });
+      if (res.ok) {
+        setDispatchInputs((prev) => ({ ...prev, [sim._id]: "" }));
+        fetchSimulations();
+        logAction(
+          "TRACK_DISPATCH",
+          `Dispatched track ${trackNum} → "${sim.title}" | Backend recalculated all 6 algorithms & wrote to MongoDB`
+        );
+      }
+    } catch (err) {
+      console.error("Dispatch error:", err);
+    } finally {
+      setDispatchingId(null);
+    }
   };
 
   useEffect(() => {
-    runSimulation(queueInput, headInput, direction);
+    runSimulation(queueInput, headInput, direction, false);
     fetchSimulations();
-  }, [runSimulation, fetchSimulations]);
+    fetchLogs();
+  }, [runSimulation, fetchSimulations, fetchLogs]);
 
   useEffect(() => {
     if (!isPlaying || !result) return;
@@ -231,10 +314,11 @@ export default function App() {
     setQueueInput(p.queue.join(", "));
     setHeadInput(String(p.head));
     setDirection(p.dir);
-    runSimulation(p.queue.join(", "), String(p.head), p.dir);
+    runSimulation(p.queue.join(", "), String(p.head), p.dir, false);
+    logAction("PRESET_LOAD", `Loaded Preset "${p.label}"`);
   };
 
-  const handleSubmit = () => runSimulation(queueInput, headInput, direction);
+  const handleSubmit = () => runSimulation(queueInput, headInput, direction, true);
 
   const svgH = 220;
   const armVisualX = armX ?? (result ? trackToX(result.sequence[0]) : trackToX(53));
@@ -554,7 +638,11 @@ export default function App() {
           {/* Theme Toggle Button */}
           <button 
             className="btn" 
-            onClick={() => setIsDarkMode(!isDarkMode)} 
+            onClick={() => {
+              const nextMode = !isDarkMode;
+              setIsDarkMode(nextMode);
+              logAction("THEME_TOGGLE", `Switched theme to ${nextMode ? "Dark Mode" : "Light Mode"}`);
+            }} 
             style={{ 
               marginLeft: 8, 
               display: "flex", 
@@ -923,6 +1011,7 @@ export default function App() {
                         className="history-card fade-in"
                         onClick={() => handleLoadSimulation(sim)}
                       >
+                        {/* Card Header */}
                         <div className="history-card-header">
                           <span className="history-card-title">{sim.title}</span>
                           <button
@@ -933,15 +1022,77 @@ export default function App() {
                             ✕
                           </button>
                         </div>
+
+                        {/* Card Meta */}
                         <div className="history-card-meta">
-                          Head: {sim.head} · Direction: {sim.direction} · Reqs: {sim.queue.length}
+                          Head: {sim.head} · Dir: {sim.direction} · {sim.queue.length} tracks
                         </div>
-                        <div className="history-card-stats">
-                          <span style={{ color: "var(--white)" }}>LOOK: {sim.lookResult.totalSeek}</span>
-                          <span style={{ color: "var(--border)" }}>|</span>
-                          <span style={{ color: "var(--dim)" }}>SSTF: {sim.comparison.sstfSeek}</span>
-                          <span style={{ color: "var(--border)" }}>|</span>
-                          <span style={{ color: "var(--dim)" }}>FCFS: {sim.comparison.fcfsSeek}</span>
+
+                        {/* Live Metrics Grid (updated by backend on dispatch) */}
+                        <div style={{
+                          display: "grid",
+                          gridTemplateColumns: "1fr 1fr 1fr",
+                          gap: 1,
+                          background: "var(--border)",
+                          marginBottom: 10,
+                          marginTop: 4,
+                        }}>
+                          {[
+                            { label: "LOOK", val: sim.lookResult.totalSeek, highlight: true },
+                            { label: "SSTF", val: sim.comparison.sstfSeek },
+                            { label: "FCFS", val: sim.comparison.fcfsSeek },
+                            { label: "SCAN", val: sim.comparison.scanSeek },
+                            { label: "C-SCAN", val: sim.comparison.cscanSeek },
+                            { label: "C-LOOK", val: sim.comparison.clookSeek },
+                          ].map(({ label, val, highlight }) => (
+                            <div key={label} style={{
+                              background: "var(--bg)",
+                              padding: "6px 8px",
+                              textAlign: "center"
+                            }}>
+                              <div style={{ fontSize: 9, letterSpacing: "0.1em", color: "var(--dimmer)", textTransform: "uppercase", marginBottom: 2 }}>{label}</div>
+                              <div style={{ fontSize: 14, fontWeight: highlight ? 700 : 400, color: highlight ? "var(--white)" : "var(--dim)" }}>{val}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* ── LIVE DISPATCH PANEL ── */}
+                        <div
+                          onClick={(e) => e.stopPropagation()}
+                          style={{
+                            marginTop: 8,
+                            padding: "10px 12px",
+                            background: "var(--bg)",
+                            border: "1px dashed var(--border)",
+                          }}
+                        >
+                          <div style={{ fontSize: 10, letterSpacing: "0.15em", textTransform: "uppercase", color: "var(--dimmer)", marginBottom: 8 }}>
+                            ⚡ Dispatch New Track → Backend recalculates
+                          </div>
+                          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                            <input
+                              type="number"
+                              min={0}
+                              max={199}
+                              placeholder="Track 0–199"
+                              value={dispatchInputs[sim._id] || ""}
+                              onChange={(e) =>
+                                setDispatchInputs((prev) => ({ ...prev, [sim._id]: e.target.value }))
+                              }
+                              style={{ flex: 1, fontSize: 13, padding: "4px 2px" }}
+                            />
+                            <button
+                              className="btn primary"
+                              style={{ padding: "6px 14px", fontSize: 11 }}
+                              disabled={dispatchingId === sim._id}
+                              onClick={(e) => handleDispatchTrack(sim, e)}
+                            >
+                              {dispatchingId === sim._id ? "..." : "Dispatch →"}
+                            </button>
+                          </div>
+                          <div style={{ fontSize: 10, color: "var(--dimmer)", marginTop: 6, fontStyle: "italic" }}>
+                            Sends PUT /api/simulations/{sim._id.slice(-6)}/dispatch · Node.js computes · MongoDB saves
+                          </div>
                         </div>
                       </div>
                     ))
@@ -951,6 +1102,71 @@ export default function App() {
 
             </div>
 
+          </div>
+        )}
+
+        {/* ── LIVE AUDIT LOGS FROM MONGODB (NEW FEATURE FOR TEACHER DEMO) ── */}
+        {result && (
+          <div className="fade-in" style={{
+            marginTop: 48,
+            border: "1px solid var(--border)",
+            background: "var(--surface)",
+            padding: "24px",
+            borderRadius: "4px"
+          }}>
+            <div style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              marginBottom: 16,
+              gap: 24,
+              flexWrap: "wrap"
+            }}>
+              <div>
+                <h3 className="serif" style={{ fontSize: 18, fontWeight: 700, color: "var(--white)" }}>
+                  💻 System Activity Logs (Live MONGODB transactions)
+                </h3>
+                <p style={{ fontSize: 13, color: "var(--dim)", marginTop: 4 }}>
+                  Every click event below triggers a REST request (`POST /api/logs`) that writes a new record directly to MongoDB. The console below dynamically pulls these records.
+                </p>
+              </div>
+              <button className="btn" onClick={handleClearLogs} style={{ borderColor: "#ef4444", color: "#ef4444" }}>
+                Clear DB Logs
+              </button>
+            </div>
+            
+            {/* Terminal Panel */}
+            <div style={{
+              background: "#050505",
+              color: "#34d399",
+              padding: "16px 20px",
+              fontFamily: "'DM Mono', monospace",
+              fontSize: "12px",
+              height: "220px",
+              overflowY: "auto",
+              border: "1px solid var(--border)",
+              borderRadius: "4px",
+              lineHeight: "1.6"
+            }}>
+              {dbLogs.length === 0 ? (
+                <div style={{ color: "#777", fontStyle: "italic" }}>
+                  &gt; Console idle. Perform an action (toggle theme, load preset, run visualizer) to write to MongoDB...
+                </div>
+              ) : (
+                dbLogs.map((log) => {
+                  const dateStr = new Date(log.timestamp).toLocaleTimeString();
+                  return (
+                    <div key={log._id} style={{ display: "flex", gap: 12, borderBottom: "1px solid #141414", padding: "6px 0", alignItems: "center" }}>
+                      <span style={{ color: "#666" }}>[{dateStr}]</span>
+                      <span style={{ color: "#38bdf8", fontWeight: "bold", minWidth: 160 }}>{log.action}</span>
+                      <span style={{ color: "var(--border)" }}>|</span>
+                      <span style={{ color: "#a7f3d0" }}>{log.details}</span>
+                      <span style={{ color: "#444", marginLeft: "auto", fontSize: "10px" }}>ID: {log._id}</span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </div>
         )}
 
